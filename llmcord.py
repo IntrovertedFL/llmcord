@@ -15,7 +15,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
 )
 
-VISION_MODEL_TAGS = ("gpt-4o", "claude-3", "gemini", "pixtral", "llava", "vision")
+VISION_MODEL_TAGS = ("gpt-4o", "claude-3", "gemini", "pixtral", "llava", "vision", "vl")
 PROVIDERS_SUPPORTING_USERNAMES = ("openai", "x-ai")
 
 ALLOWED_FILE_TYPES = ("image", "text")
@@ -71,20 +71,23 @@ class MsgNode:
 async def on_message(new_msg):
     global msg_nodes, last_task_time
 
-    if (
-        new_msg.channel.type not in ALLOWED_CHANNEL_TYPES
-        or (new_msg.channel.type != discord.ChannelType.private and discord_client.user not in new_msg.mentions)
-        or new_msg.author.bot
-    ):
+    is_dm: bool = new_msg.channel.type == discord.ChannelType.private
+
+    if new_msg.author.bot or new_msg.channel.type not in ALLOWED_CHANNEL_TYPES or (not is_dm and discord_client.user not in new_msg.mentions):
         return
 
     cfg = get_config()
 
+    allow_dms: bool = cfg["allow_dms"]
     allowed_channel_ids = cfg["allowed_channel_ids"]
     allowed_role_ids = cfg["allowed_role_ids"]
 
-    if (allowed_channel_ids and not any(id in allowed_channel_ids for id in (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None)))) or (
-        allowed_role_ids and not any(role.id in allowed_role_ids for role in getattr(new_msg.author, "roles", []))
+    channel_ids = (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None))
+
+    if (
+        (is_dm and not allow_dms)
+        or (allowed_channel_ids and not is_dm and not any(id in allowed_channel_ids for id in channel_ids))
+        or (allowed_role_ids and not any(role.id in allowed_role_ids for role in getattr(new_msg.author, "roles", [])))
     ):
         return
 
@@ -93,8 +96,8 @@ async def on_message(new_msg):
     api_key = cfg["providers"][provider].get("api_key", "sk-no-key-required")
     openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
-    accept_images: bool = any(x in model for x in VISION_MODEL_TAGS)
-    accept_usernames: bool = any(x in provider for x in PROVIDERS_SUPPORTING_USERNAMES)
+    accept_images: bool = any(x in model.lower() for x in VISION_MODEL_TAGS)
+    accept_usernames: bool = any(x in provider.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
 
     max_text = cfg["max_text"]
     max_images = cfg["max_images"] if accept_images else 0
@@ -107,7 +110,7 @@ async def on_message(new_msg):
     messages = []
     user_warnings = set()
     curr_msg = new_msg
-    while curr_msg and len(messages) < max_messages:
+    while curr_msg != None and len(messages) < max_messages:
         curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
 
         async with curr_node.lock:
@@ -159,7 +162,7 @@ async def on_message(new_msg):
             else:
                 content = curr_node.text[:max_text]
 
-            if content:
+            if content != "":
                 message = dict(content=content, role=curr_node.role)
                 if accept_usernames and curr_node.user_id != None:
                     message["name"] = str(curr_node.user_id)
@@ -172,7 +175,7 @@ async def on_message(new_msg):
                 user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
             if curr_node.has_bad_attachments:
                 user_warnings.add("⚠️ Unsupported attachments")
-            if curr_node.fetch_next_failed or (curr_node.next_msg and len(messages) == max_messages):
+            if curr_node.fetch_next_failed or (curr_node.next_msg != None and len(messages) == max_messages):
                 user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
 
             curr_msg = curr_node.next_msg
@@ -227,8 +230,8 @@ async def on_message(new_msg):
                         is_good_finish: bool = finish_reason != None and any(finish_reason.lower() == x for x in ("stop", "end_turn"))
 
                         if ready_to_edit or is_final_edit:
-                            while edit_task != None and not edit_task.done():
-                                await asyncio.sleep(0)
+                            if edit_task != None:
+                                await edit_task
 
                             embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
                             embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
@@ -247,9 +250,9 @@ async def on_message(new_msg):
     except:
         logging.exception("Error while generating response")
 
-    for msg in response_msgs:
-        msg_nodes[msg.id].text = "".join(response_contents)
-        msg_nodes[msg.id].lock.release()
+    for response_msg in response_msgs:
+        msg_nodes[response_msg.id].text = "".join(response_contents)
+        msg_nodes[response_msg.id].lock.release()
 
     # Delete oldest MsgNodes (lowest message IDs) from the cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
